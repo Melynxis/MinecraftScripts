@@ -11,7 +11,9 @@
 --
 -- NOTE (ATM10/AP compatibility):
 --   Your rs_bridge exposes craftItem/getItems/exportItem, but NOT isItemCrafting.
---   So we use a cooldown to avoid spamming craft requests each scan.
+--   ALSO: getItems() may NOT report NBT/affixed items (like your Crafting Table with EU/affix),
+--         but exportItem() CAN still export them by registry name.
+--   Therefore: we ALWAYS attempt export first, then craft only the remainder.
 
 --------------------------------------------------------------------
 -- CONFIG
@@ -136,6 +138,7 @@ local function craft(item, count)
   return rs.craftItem and rs.craftItem({name=item, count=count}) == true
 end
 
+-- Keep this for optional diagnostics; DO NOT trust it for NBT/affixed items.
 local function listItems()
   local map = {}
   local items = rs.getItems()
@@ -207,7 +210,9 @@ local function scan()
     return
   end
 
+  -- Optional snapshot (not trusted for NBT items). Kept for debugging/visibility.
   local inv = listItems()
+
   local row = 4
   local w,h = out.getSize()
 
@@ -223,6 +228,7 @@ local function scan()
     local target = r.target or "unknown"
     local item   = getItemId(r)
 
+    -- Show request line (and basic ID visibility debug if you want)
     writeLine(row, string.format("%d %s", count, name), colors.white)
     row = row + 1
 
@@ -232,30 +238,48 @@ local function scan()
       row = row + 2
 
     else
-      local provided = 0
-      if inv[item] and inv[item] > 0 then
-        provided = exportToStash({name=item,count=count})
-      end
+      ----------------------------------------------------------------
+      -- EXPORT-FIRST LOGIC (NBT-safe):
+      -- Always attempt export by registry name first, even if getItems()
+      -- reports 0 (NBT/affixed items may be hidden from getItems()).
+      ----------------------------------------------------------------
+      local provided = exportToStash({ name = item, count = count })
+      local remaining = count - provided
 
-      if provided >= count then
+      if remaining <= 0 then
         okCount = okCount + 1
-        writeLine(row, "  OK -> "..target, colors.green)
+        writeLine(row, "  OK (exported " .. tostring(provided) .. ") -> " .. target, colors.green)
         row = row + 2
       else
-        -- schedule crafting (with cooldown) and show truth on the monitor
+        -- Only craft what is still missing
         if canSchedule(item) then
-          local ok = craft(item, count)
+          local ok = craft(item, remaining)
           if ok then
             markScheduled(item)
             schedCount = schedCount + 1
-            writeLine(row, "  SCHEDULED -> "..target, colors.yellow)
+            writeLine(
+              row,
+              "  SCHEDULED " .. tostring(remaining) ..
+              " (missing; exported " .. tostring(provided) .. ") -> " .. target,
+              colors.yellow
+            )
           else
             failCount = failCount + 1
-            writeLine(row, "  CRAFT FAIL (no pattern?) -> "..target, colors.red)
+            writeLine(
+              row,
+              "  CRAFT FAIL " .. tostring(remaining) ..
+              " (missing; exported " .. tostring(provided) .. ") -> " .. target,
+              colors.red
+            )
           end
         else
           waitCount = waitCount + 1
-          writeLine(row, "  WAIT (cooldown) -> "..target, colors.orange)
+          writeLine(
+            row,
+            "  WAIT (cooldown) " .. tostring(remaining) ..
+            " missing; exported " .. tostring(provided) .. " -> " .. target,
+            colors.orange
+          )
         end
         row = row + 2
       end
