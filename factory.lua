@@ -8,6 +8,10 @@
 --   Monitor wall connected via Wired Modem + Network Cable
 --
 -- Monitor network name (confirmed): monitor_0
+--
+-- NOTE (ATM10/AP compatibility):
+--   Your rs_bridge exposes craftItem/getItems/exportItem, but NOT isItemCrafting.
+--   So we use a cooldown to avoid spamming craft requests each scan.
 
 --------------------------------------------------------------------
 -- CONFIG
@@ -22,6 +26,9 @@ local MONITOR_TEXT_SCALE = 0.5
 
 local SECONDS_BETWEEN_SCANS = 30
 local PAUSE_AT_NIGHT = true
+
+-- Prevent rescheduling the same craft every scan (since isItemCrafting is unavailable)
+local CRAFT_COOLDOWN_SECONDS = 120   -- 2 minutes per item ID
 
 local LOG_REQUESTS_TO_FILE = false
 local LOG_FILE = "factory_requests.log"
@@ -91,7 +98,12 @@ local function writeLine(y, text, color)
   out.setCursorPos(1,y)
   out.setTextColor(color or colors.white)
   if #text > w then text = text:sub(1,w) end
-  out.write(text .. string.rep(" ", w - #text))
+  out.write(text .. string.rep(" ", math.max(0, w - #text)))
+end
+
+local function footer(text)
+  local _, h = out.getSize()
+  writeLine(h, text, colors.lightGray)
 end
 
 --------------------------------------------------------------------
@@ -113,15 +125,11 @@ local colony = peripheral.wrap(COLONY_SIDE)
 if not colony then die("Colony Integrator not found on "..COLONY_SIDE) end
 
 --------------------------------------------------------------------
--- RS HELPERS (ATM10)
+-- RS HELPERS (ATM10/AP)
 --------------------------------------------------------------------
 
 local function exportToStash(stack)
   return rs.exportItem(stack, STASH_TARGET) or 0
-end
-
-local function isCrafting(item)
-  return rs.isItemCrafting and rs.isItemCrafting(item) or false
 end
 
 local function craft(item, count)
@@ -138,6 +146,26 @@ local function listItems()
 end
 
 --------------------------------------------------------------------
+-- CRAFT COOLDOWN (since isItemCrafting is not available)
+--------------------------------------------------------------------
+
+local lastScheduled = {}  -- itemId -> epoch ms
+
+local function nowMs()
+  return os.epoch("utc")
+end
+
+local function canSchedule(itemId)
+  local t = lastScheduled[itemId]
+  if not t then return true end
+  return (nowMs() - t) >= (CRAFT_COOLDOWN_SECONDS * 1000)
+end
+
+local function markScheduled(itemId)
+  lastScheduled[itemId] = nowMs()
+end
+
+--------------------------------------------------------------------
 -- REQUEST SCAN
 --------------------------------------------------------------------
 
@@ -147,17 +175,35 @@ local function isNight()
 end
 
 local function getItemId(r)
-  return r.items and r.items[1] and r.items[1].name or nil
+  -- MineColonies requests usually provide r.items[1].name as registry ID.
+  if r and r.items and r.items[1] then
+    local it = r.items[1]
+    return it.name or it.item or it.id or it.itemName or nil
+  end
+  return nil
+end
+
+local function maybeLogRequests(reqs)
+  if not LOG_REQUESTS_TO_FILE then return end
+  local f = fs.open(LOG_FILE, "w")
+  if f then
+    f.write(textutils.serialize(reqs))
+    f.close()
+  end
 end
 
 local function scan()
   cls()
   writeLine(1,"MineColonies Factory Controller",colors.yellow)
-  writeLine(2,"Updated: "..textutils.formatTime(os.time(),false),colors.lightGray)
+  writeLine(2,"Updated: "..textutils.formatTime(os.time(),false)..
+              "  Scan: "..tostring(SECONDS_BETWEEN_SCANS).."s", colors.lightGray)
 
   local reqs = colony.getRequests()
+  maybeLogRequests(reqs)
+
   if not reqs or next(reqs)==nil then
     writeLine(4,"No open requests.",colors.green)
+    footer("Ready.")
     return
   end
 
@@ -165,21 +211,26 @@ local function scan()
   local row = 4
   local w,h = out.getSize()
 
+  local total, okCount, schedCount, failCount, skipCount, waitCount = 0,0,0,0,0,0
+
   for _,r in pairs(reqs) do
-    if row > h-1 then break end
+    if row > h-2 then break end
+    total = total + 1
 
-    local name = r.name or "unknown"
-    local desc = r.desc or ""
-    local count = r.count or 0
+    local name   = r.name or "unknown"
+    local desc   = r.desc or ""
+    local count  = r.count or 0
     local target = r.target or "unknown"
-    local item = getItemId(r)
+    local item   = getItemId(r)
 
-    writeLine(row, count.." "..name, colors.white)
-    row=row+1
+    writeLine(row, string.format("%d %s", count, name), colors.white)
+    row = row + 1
 
-    if shouldSkip(name,desc) or not item then
-      writeLine(row,"  SKIP -> "..target,colors.blue)
-      row=row+1
+    if shouldSkip(name,desc) or not item or count <= 0 then
+      skipCount = skipCount + 1
+      writeLine(row, "  SKIP -> "..target, colors.blue)
+      row = row + 2
+
     else
       local provided = 0
       if inv[item] and inv[item] > 0 then
@@ -187,35 +238,52 @@ local function scan()
       end
 
       if provided >= count then
-        writeLine(row,"  OK -> "..target,colors.green)
-        row=row+1
+        okCount = okCount + 1
+        writeLine(row, "  OK -> "..target, colors.green)
+        row = row + 2
       else
-        if not isCrafting(item) then
-          craft(item,count)
+        -- schedule crafting (with cooldown) and show truth on the monitor
+        if canSchedule(item) then
+          local ok = craft(item, count)
+          if ok then
+            markScheduled(item)
+            schedCount = schedCount + 1
+            writeLine(row, "  SCHEDULED -> "..target, colors.yellow)
+          else
+            failCount = failCount + 1
+            writeLine(row, "  CRAFT FAIL (no pattern?) -> "..target, colors.red)
+          end
+        else
+          waitCount = waitCount + 1
+          writeLine(row, "  WAIT (cooldown) -> "..target, colors.orange)
         end
-        writeLine(row,"  CRAFT -> "..target,colors.yellow)
-        row=row+1
+        row = row + 2
       end
     end
-
-    row=row+1
   end
+
+  footer(string.format(
+    "Total:%d OK:%d Scheduled:%d Wait:%d Skipped:%d Fail:%d",
+    total, okCount, schedCount, waitCount, skipCount, failCount
+  ))
 end
 
 --------------------------------------------------------------------
 -- COMMAND MODE
+--   factory send <item> <count>
 --------------------------------------------------------------------
 
 local args={...}
 if args[1]=="send" then
   local item=args[2]
   local cnt=tonumber(args[3] or "")
-  if not item or not cnt then
+  if not item or not cnt or cnt <= 0 then
     print("Usage: factory send <item> <count>")
+    print("Example: factory send minecraft:cobblestone 16")
     return
   end
   local moved=exportToStash({name=item,count=cnt})
-  print("Exported "..moved.." / "..cnt.." "..item)
+  print("Exported "..moved.." / "..cnt.." "..item.." to stash")
   return
 end
 
@@ -237,6 +305,9 @@ while true do
         scan()
         remaining=SECONDS_BETWEEN_SCANS
       end
+    else
+      -- show pause note but still keep screen alive
+      writeLine(3, "Night detected: paused (tap monitor to scan anyway)", colors.red)
     end
     timer=os.startTimer(1)
 
