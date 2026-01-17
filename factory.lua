@@ -159,12 +159,13 @@ end
 
 local function listItemsNoNBT()
   local outMap = {}
-  local items = rs.listItems()
-  for _, it in ipairs(items) do
-    if not it.nbt then
-      outMap[it.name] = it.amount
-    end
+  local items = rs.getItems()
+
+  for name, data in pairs(items) do
+    -- RS Bridge getItems() does not include NBT variants
+    outMap[name] = data.amount or 0
   end
+
   return outMap
 end
 
